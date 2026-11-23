@@ -901,8 +901,8 @@ final class RazorpayCheckoutSession
 
             if ($is400ServerError) {
                 // HTTP 400 SERVER_ERROR: order_id may be stale — recreate order then retry payment
-                $this->log("  HTTP 400 SERVER_ERROR on payment create (attempt " . ($retry + 1) . "), recreating order + retrying in 2s...");
-                usleep(2_000_000);
+                $this->log("  HTTP 400 SERVER_ERROR on payment create (attempt " . ($retry + 1) . "), recreating order + retrying in 1s...");
+                usleep(1_000_000); // reduced from 2s to 1s for speed
 
                 try {
                     $this->createOrder();
@@ -1422,7 +1422,7 @@ final class RazorpayCheckoutSession
         $outcome = $this->classifyOutcome();
         $elapsed = microtime(true) - $this->startTime;
 
-        return [
+        $result = [
             'card'       => $this->formatCardLine(),
             'status'     => $outcome['status'],
             'message'    => $outcome['message'],
@@ -1430,6 +1430,27 @@ final class RazorpayCheckoutSession
             'time_taken' => sprintf('%.2fs', $elapsed),
             'dev'        => '@Mod_By_Assassin',
         ];
+
+        // Debug mode: ?debug=1 — shows raw Razorpay responses to diagnose SERVER_ERROR
+        $isDebug = (isset($_GET['debug']) && $_GET['debug'] === '1')
+            || getenv('RAZORPAY_DEBUG') === '1';
+        if ($isDebug) {
+            $rawResp = $this->tokens['create_response_raw'] ?? '';
+            $decoded = json_decode($rawResp, true);
+            $result['_debug'] = [
+                'payment_create_http'   => $this->tokens['create_http_code'] ?? null,
+                'payment_create_error'  => $decoded['error'] ?? $rawResp,
+                'order_id'              => $this->tokens['order_id'] ?? '',
+                'key_id'                => $this->tokens['key_id'] ?? '',
+                'payment_link_id'       => $this->tokens['payment_link_id'] ?? '',
+                'session_token_present' => !empty($this->tokens['session_token']),
+                'shield_context_len'    => strlen($this->tokens['shield_context'] ?? ''),
+                'order_currency'        => $this->orderCurrency(),
+                'run_error'             => $this->runError,
+            ];
+        }
+
+        return $result;
     }
 
     private function formatCardLine(): string
