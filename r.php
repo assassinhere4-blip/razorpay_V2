@@ -567,13 +567,16 @@ final class RazorpayCheckoutSession
         $this->tokens['item_id']           = $firstItemId;
 
         // -- Key rule ----------------------------------------------------------
-        // If merchant has a fixed price > AMOUNT_PAISE (?100), we cannot afford
+        // If merchant has a fixed price > AMOUNT_PAISE (₹100), we cannot afford
         // it — flag as amount_mismatch and stop further processing.
         // If fixed price <= AMOUNT_PAISE, we use their amount and proceed.
+        // EXCEPTION: non-INR sites (e.g. USD) — skip paise comparison entirely;
+        // the order amount from createOrder() response is used directly.
         // ---------------------------------------------------------------------
         $pageFixed = (int) ($this->tokens['page_item_amount'] ?? 0);
         $isFixed   = ($this->tokens['page_item_editable'] ?? 'yes') === 'no';
-        if ($isFixed && $pageFixed > $this->amountPaise) {
+        $pageCur   = strtoupper((string) ($this->tokens['currency'] ?? 'INR'));
+        if ($isFixed && $pageFixed > $this->amountPaise && $pageCur === 'INR') {
             $this->forcedOutcome = [
                 'status'  => 'error',
                 'message' => 'Amount too small',
@@ -812,26 +815,36 @@ final class RazorpayCheckoutSession
 
     private function fetchPreferences(): void
     {
-        $url = self::PREFERENCES_URL . '?' . $this->checkoutEntityQuery();
+        try {
+            $url = self::PREFERENCES_URL . '?' . $this->checkoutEntityQuery();
 
-        $payload = [
-            'query'        => [
-                ['resource' => 'intl_config'],
-                ['resource' => 'paywithpartner'],
-            ],
-            'query_params' => $this->buildPreferencesQueryParams(),
-            'action'       => 'get',
-        ];
+            $payload = [
+                'query'        => [
+                    ['resource' => 'intl_config'],
+                    ['resource' => 'paywithpartner'],
+                ],
+                'query_params' => $this->buildPreferencesQueryParams(),
+                'action'       => 'get',
+            ];
 
-        $body = $this->requestJson('POST', $url, $this->checkoutApiHeaders(true), $payload);
-        $data = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+            $body = $this->requestJson('POST', $url, $this->checkoutApiHeaders(true), $payload);
+            $data = json_decode($body, true, 512);
 
-        $shield = $data['shield_data'] ?? [];
-        $this->tokens['shield_context'] = $shield['shield_context'] ?? '';
-        $this->tokens['shield_key']     = $shield['shield_key'] ?? '';
+            if (!is_array($data)) {
+                $this->log('  fetchPreferences: non-JSON response, shield_context will be empty');
+                return;
+            }
 
-        $this->logToken('shield_context', $this->tokens['shield_context']);
-        $this->logToken('shield_key', $this->tokens['shield_key']);
+            $shield = $data['shield_data'] ?? [];
+            $this->tokens['shield_context'] = $shield['shield_context'] ?? '';
+            $this->tokens['shield_key']     = $shield['shield_key'] ?? '';
+
+            $this->logToken('shield_context', $this->tokens['shield_context']);
+            $this->logToken('shield_key', $this->tokens['shield_key']);
+        } catch (Throwable $e) {
+            // Preferences is non-critical — payment can proceed without shield_context
+            $this->log('  fetchPreferences: failed (' . substr($e->getMessage(), 0, 120) . '), continuing without shield');
+        }
     }
 
     private function buildPreferencesQueryParams(): array
@@ -886,47 +899,10 @@ final class RazorpayCheckoutSession
             );
         }
 
-        // Retry on transient SERVER_ERROR — HTTP 400 and 500 handled SEPARATELY:
-        // HTTP 400 + SERVER_ERROR = Razorpay gateway crash on valid request → recreate order + retry
-        // HTTP 500 + SERVER_ERROR = Razorpay server down → just wait + retry (no order recreate needed)
-        $maxRetries = 2;
-        for ($retry = 0; $retry < $maxRetries; $retry++) {
-            $httpNow = $this->lastHttpCode;
-            $decoded = json_decode($response, true);
-            $errCode = strtoupper((string) ($decoded['error']['code'] ?? ''));
-            $errReason = strtolower((string) ($decoded['error']['reason'] ?? ''));
-
-            $is400ServerError = ($httpNow === 400 && $errCode === 'SERVER_ERROR');
-            $is500ServerError = ($httpNow === 500 && ($errCode === 'SERVER_ERROR' || $errReason === 'server_error'));
-
-            if ($is400ServerError) {
-                // HTTP 400 SERVER_ERROR: order_id may be stale — recreate order then retry payment
-                $this->log("  HTTP 400 SERVER_ERROR on payment create (attempt " . ($retry + 1) . "), recreating order + retrying in 1s...");
-                usleep(1_000_000); // reduced from 2s to 1s for speed
-
-                try {
-                    $this->createOrder();
-                    if ($this->forcedOutcome !== null) {
-                        return; // Order failed — stop
-                    }
-                } catch (Throwable $orderEx) {
-                    $this->log("  Order recreate failed: " . substr($orderEx->getMessage(), 0, 120));
-                    // Fall through with old order_id
-                }
-
-                $body     = $this->buildPaymentCreateBody($includeCheckoutId);
-                $response = $this->request('POST', $url, $this->checkoutApiFormHeaders(), $body, false);
-
-            } elseif ($is500ServerError) {
-                // HTTP 500 SERVER_ERROR: Razorpay server down — just wait and retry same request
-                $this->log("  HTTP 500 SERVER_ERROR on payment create (attempt " . ($retry + 1) . "), retrying in 3s...");
-                usleep(3_000_000);
-                $response = $this->request('POST', $url, $this->checkoutApiFormHeaders(), $body, false);
-
-            } else {
-                break; // Different error — stop retrying
-            }
-        }
+        // No retry loop — SERVER_ERROR on payment create is caused by bad request fields,
+        // not transient issues. Retrying wastes 10+ seconds and always fails the same way.
+        // The fix is sending correct fields (no empty key_id, no empty shield_context).
+        // HTTP 500 (server down) is rare; handled by classify step below.
 
         $this->tokens['create_response_raw'] = $response;
         $this->tokens['create_http_code']    = $this->lastHttpCode;
@@ -1516,20 +1492,19 @@ final class RazorpayCheckoutSession
             ],
         ], JSON_THROW_ON_ERROR));
 
+        // Build base payment body — only include fields with non-empty values.
+        // Razorpay backend crashes (HTTP 400 SERVER_ERROR) when unexpected empty-string
+        // fields like key_id="" or _[shield_context]="" are present in the payload.
         $meta = [
-            'notes[comment]'              => $this->orderComment,
-            'payment_link_id'             => $this->tokens['payment_link_id'] ?? '',
-            'key_id'                      => $this->tokens['key_id'] ?? '',
-            'contact'                     => $this->tokens['contact'],
-            'email'                       => $this->tokens['email'],
-            'currency'                    => $this->orderCurrency(),
-            '_[checkout_id]'             => $checkoutId,
-            '_[device.id]'               => $deviceId,
-            '_[library]'                 => 'checkoutjs',
-            '_[library_src]'             => 'no-src',
+            'contact'                    => $this->tokens['contact'],
+            'email'                      => $this->tokens['email'],
+            'currency'                   => $this->orderCurrency(),
+            '_[checkout_id]'            => $checkoutId,
+            '_[device.id]'              => $deviceId,
+            '_[library]'                => 'checkoutjs',
+            '_[library_src]'            => 'no-src',
             '_[current_script_src]'     => 'no-src',
             '_[platform]'               => 'browser',
-            '_[env]'                    => '',
             '_[is_magic_script]'        => 'false',
             '_[os]'                     => 'windows',
             '_[referer]'                => $this->paymentReferer,
@@ -1548,18 +1523,37 @@ final class RazorpayCheckoutSession
             'card[expiry_month]'        => $this->card['expiry_month'],
             'card[expiry_year]'         => $this->card['expiry_year'],
             'save'                      => '0',
-            '_[shield_context]'         => $this->tokens['shield_context'] ?? '',
         ];
+
+        // Only add optional fields when non-empty — empty strings crash Razorpay backend
+        $keyId = trim($this->tokens['key_id'] ?? '');
+        if ($keyId !== '') {
+            $meta['key_id'] = $keyId;
+        }
+
+        $plId = trim($this->tokens['payment_link_id'] ?? '');
+        if ($plId !== '') {
+            $meta['payment_link_id'] = $plId;
+        }
+
+        $comment = trim($this->orderComment);
+        if ($comment !== '') {
+            $meta['notes[comment]'] = $comment;
+        }
+
+        // shield_context: only send if non-empty — empty string causes SERVER_ERROR
+        $shieldCtx = trim($this->tokens['shield_context'] ?? '');
+        if ($shieldCtx !== '') {
+            $meta['_[shield_context]'] = $shieldCtx;
+        }
 
         if ($includeCheckoutId && $checkoutId !== '') {
             $meta['checkout_id'] = $checkoutId;
         }
 
-        // DO NOT send currency_request_id or dcc_currency in payment body.
-        // Sending these DCC fields on an INR site with an international card causes
-        // Razorpay to return HTTP 400 SERVER_ERROR (gateway confusion with DCC flow).
-        // Omitting them makes Razorpay charge in order currency (INR) automatically.
-        // $crid = $this->tokens['currency_request_id'] — intentionally not sent.
+        // DCC fields intentionally omitted — currency_request_id + dcc_currency cause SERVER_ERROR
+        return http_build_query($meta, '', '&', PHP_QUERY_RFC3986);
+    }
 
         return http_build_query($meta, '', '&', PHP_QUERY_RFC3986);
     }
@@ -1800,14 +1794,12 @@ final class RazorpayCheckoutSession
 
     private function fetchCbFlows(): void
     {
-        // Skip DCC/cb_flows entirely for INR-currency sites.
-        // Sending currency_request_id + dcc_currency in the payment body causes
-        // HTTP 400 SERVER_ERROR on INR sites with international cards.
-        // We collect the response for logging only but never store currency_request_id.
-        if ($this->orderCurrency() === 'INR') {
-            $this->log('  fetchCbFlows: skipped (INR site — DCC fields omitted from payment body)');
-            return;
-        }
+        // Skip DCC/cb_flows entirely — NEVER send currency_request_id or dcc_currency in payment body.
+        // For INR sites: DCC fields cause HTTP 400 SERVER_ERROR on international cards.
+        // For USD sites (e.g. fopenfoall): order currency is already USD — no DCC needed.
+        // The payment body will just send currency=orderCurrency() with no DCC wrapper.
+        $this->log('  fetchCbFlows: skipped (DCC fields never sent — avoids SERVER_ERROR)');
+        return;
 
         $url = self::CB_FLOWS . '?' . $this->checkoutEntityQuery([], false);
 
@@ -2059,11 +2051,16 @@ final class RazorpayCheckoutSession
                 $opts[CURLOPT_PROXYUSERPWD] = $this->proxy['user'] . ':' . $this->proxy['pass'];
             }
             // Force HTTP CONNECT tunnel for HTTPS — without this, proxy sends plain HTTP
-            // to an HTTPS endpoint causing "wrong version number" TLS error
+            // to an HTTPS endpoint causing "wrong version number" TLS error.
+            // Also force HTTP/1.1 — HTTP/2 multiplexing over proxy CONNECT tunnels causes
+            // "unexpected eof while reading" TLS errors with residential proxies.
             if (str_starts_with($url, 'https://')) {
                 $opts[CURLOPT_HTTPPROXYTUNNEL] = true;
-                $opts[CURLOPT_SSL_VERIFYPEER]  = false; // proxy tunnel; inner SSL still encrypted
+                $opts[CURLOPT_SSL_VERIFYPEER]  = false;
                 $opts[CURLOPT_SSL_VERIFYHOST]  = 0;
+                $opts[CURLOPT_HTTP_VERSION]    = CURL_HTTP_VERSION_1_1; // force HTTP/1.1 — no HTTP/2 over proxy
+                $opts[CURLOPT_SSLVERSION]      = CURL_SSLVERSION_TLSv1_2; // force TLS 1.2 — prevents eof errors
+                $opts[CURLOPT_TCP_NODELAY]     = true; // disable Nagle — prevents stalls
             }
         }
 
