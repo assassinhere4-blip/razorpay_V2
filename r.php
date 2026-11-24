@@ -872,7 +872,10 @@ final class RazorpayCheckoutSession
     {
         $this->ensureCustomerDetails();
 
-        $url              = self::PAYMENT_CREATE . '?' . $this->checkoutAuthQuery();
+        // Include x_entity_id (order_id) in URL — required by Razorpay WAF for payment create
+        $url              = self::PAYMENT_CREATE . '?' . $this->checkoutAuthQuery([
+            'x_entity_id' => $this->tokens['order_id'] ?? '',
+        ]);
         $includeCheckoutId = false;
         $body             = $this->buildPaymentCreateBody($includeCheckoutId);
 
@@ -1430,7 +1433,13 @@ final class RazorpayCheckoutSession
                 'payment_link_id'       => $this->tokens['payment_link_id'] ?? '',
                 'session_token_present' => !empty($this->tokens['session_token']),
                 'shield_context_len'    => strlen($this->tokens['shield_context'] ?? ''),
+                'preferences_error'     => $this->tokens['preferences_error'] ?? null,
                 'order_currency'        => $this->orderCurrency(),
+                'page_auth_mode'        => $this->tokens['page_auth_mode'] ?? 'unknown',
+                'payment_create_url_has_entity' => str_contains(
+                    self::PAYMENT_CREATE . '?' . $this->checkoutAuthQuery(['x_entity_id' => $this->tokens['order_id'] ?? '']),
+                    'x_entity_id'
+                ),
                 'run_error'             => $this->runError,
             ];
         }
@@ -1957,15 +1966,14 @@ final class RazorpayCheckoutSession
     private function checkoutApiFormHeaders(): array
     {
         return $this->baseHeaders([
-            'Accept: */*',
+            'Accept: application/json, text/plain, */*',
             'Content-type: application/x-www-form-urlencoded',
             'Origin: https://api.razorpay.com',
-            'priority: u=1, i',
-            'Referer: ' . $this->checkoutPublicUrl(true),
+            // Real browser Referer: checkout iframe page, not the long checkout/public URL
+            'Referer: https://api.razorpay.com/',
             'Sec-Fetch-Dest: empty',
             'Sec-Fetch-Mode: cors',
             'Sec-Fetch-Site: same-origin',
-            'Sec-Fetch-Storage-Access: active',
             'x-session-token: ' . ($this->tokens['session_token'] ?? ''),
         ]);
     }
