@@ -779,10 +779,11 @@ final class RazorpayCheckoutSession
     private function extractCheckoutJsTokens(string $js): void
     {
         $patterns = [
-            'build_number' => '/,\s*v=(\d+),\s*b="production"/',
-            'commit_hash'  => '/b="production",\s*g="([a-f0-9]{40})"/',
+            'build_number' => '/,\s*v=(\d+),\s*b="prod(?:uction)?"/',
+            'commit_hash'  => '/b="prod(?:uction)?",\s*g="([a-f0-9]{40})"/',
             'build_v1'     => '/build_v1:"([a-f0-9]{40})"/',
-            'traffic_env'  => '/b="(production|sandbox|canary)"/',
+            // checkout.js uses "prod" in minified builds, "production" in dev builds
+            'traffic_env'  => '/b="(prod(?:uction)?|sandbox|canary)"/',
         ];
 
         foreach ($patterns as $key => $pattern) {
@@ -809,8 +810,8 @@ final class RazorpayCheckoutSession
         }
 
         if (empty($this->tokens['traffic_env'])) {
-            // Live Razorpay pages use 'production'. Only override if env var explicitly set.
-            $this->tokens['traffic_env'] = $this->trafficEnvOverride ?? 'production';
+            // checkout.js live builds use 'prod' (minified). Fallback to 'prod' for live sites.
+            $this->tokens['traffic_env'] = $this->trafficEnvOverride ?? 'prod';
         }
     }
 
@@ -880,21 +881,11 @@ final class RazorpayCheckoutSession
     {
         $this->ensureCustomerDetails();
 
-        // Build payment create URL — session_token goes in header only (not URL) for WAF compliance.
-        // Real Chrome XHR sends session_token only as x-session-token header, not in URL query.
-        // keyless_header and x_entity_id still go in URL (Razorpay WAF requires them there).
-        $urlParams = [];
-        $kh = trim($this->tokens['keyless_header'] ?? '');
-        if ($kh !== '') {
-            $urlParams['keyless_header'] = $kh;
-        }
-        $keyId = trim($this->tokens['key_id'] ?? '');
-        if ($keyId !== '') {
-            $urlParams['key_id'] = $keyId;
-        }
-        $urlParams['x_entity_id'] = $this->tokens['order_id'] ?? '';
-
-        $url              = self::PAYMENT_CREATE . '?' . http_build_query($urlParams);
+        // Real Chrome payment create URL: ?session_token=...&keyless_header=...
+        // session_token goes in BOTH the URL query AND the x-session-token header.
+        // Real browser trace confirms: no x_entity_id in URL for payment create.
+        // checkoutAuthQuery() returns: session_token + keyless_header (+ key_id if present)
+        $url              = self::PAYMENT_CREATE . '?' . $this->checkoutAuthQuery();
         $includeCheckoutId = false;
         $body             = $this->buildPaymentCreateBody($includeCheckoutId);
 
@@ -1927,8 +1918,11 @@ final class RazorpayCheckoutSession
 
     private function checkoutPublicUrl(bool $withSessionToken): string
     {
+        // Razorpay checkout.js minified builds use "prod", not "production".
+        // Fallback: "prod" for live sites (checkout.js auto-detects in real browser).
+        $trafficEnv = $this->tokens['traffic_env'] ?? 'prod';
         $params = [
-            'traffic_env'        => $this->tokens['traffic_env'] ?? 'production',
+            'traffic_env'        => $trafficEnv,
             'build'              => $this->tokens['commit_hash'] ?? '',
             'build_v1'           => $this->tokens['build_v1'] ?? '',
             'checkout_v2'        => '1',
@@ -2070,17 +2064,11 @@ final class RazorpayCheckoutSession
         return $this->baseHeaders($headers);
     }
 
-    /** Use proxy for all steps including payment create.
-     *  403 on payment create is a request fingerprint issue (missing priority header),
-     *  NOT an IP issue — consistent 403 across ALL proxy IPs confirmed.
-     *  Fix: route payment create through proxy AND send correct Chrome XHR headers. */
+    /** Route ALL requests through proxy — every step including payment create, 3DS, cancel.
+     *  User requirement: proxy across all. */
     private function shouldUseProxyForUrl(string $url): bool
     {
-        // 3DS authenticate and cancel: direct (payment_id tied to same session)
-        if (str_contains($url, '/pg_router/') || str_contains($url, '/authenticate')) {
-            return false;
-        }
-        return true; // All steps (including payment create) use proxy
+        return true; // Proxy on for every step
     }
 
     private function requestJson(string $method, string $url, array $headers, array $payload): string
