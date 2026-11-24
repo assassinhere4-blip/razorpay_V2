@@ -1460,6 +1460,9 @@ final class RazorpayCheckoutSession
                 'page_auth_mode'        => $this->tokens['page_auth_mode'] ?? 'unknown',
                 'traffic_env'           => $this->tokens['traffic_env'] ?? 'unknown',
                 'track_id'              => $this->tokens['rzp_track_id'] ?? '',
+                'payment_create_referer'=> $this->checkoutPublicUrl(false),
+                'build_number'          => $this->tokens['build_number'] ?? '',
+                'commit_hash'           => substr($this->tokens['commit_hash'] ?? '', 0, 12),
                 'run_error'             => $this->runError,
             ];
         }
@@ -1989,6 +1992,8 @@ final class RazorpayCheckoutSession
 
     private function checkoutApiFormHeaders(): array
     {
+    private function checkoutApiFormHeaders(): array
+    {
         // x-razorpay-trackid: UUID generated once per checkout session by real browser
         $trackId = $this->tokens['rzp_track_id'] ?? '';
         if ($trackId === '') {
@@ -2003,21 +2008,30 @@ final class RazorpayCheckoutSession
             $this->tokens['rzp_track_id'] = $trackId;
         }
 
-        return $this->baseHeaders([
+        // Real Chrome payment create XHR header order (from browser devtools trace):
+        // Referer = full checkout/public iframe URL (not just the domain root)
+        // The WAF validates Referer as proof request comes from inside the checkout iframe.
+        $referer = $this->checkoutPublicUrl(false); // iframe URL without session_token
+
+        $p = $this->profile;
+        // Return headers in exact Chrome 117+ order for payment create XHR
+        return [
             'Accept: application/json, text/plain, */*',
+            'Accept-Language: ' . $p['accept_language'],
             'Content-type: application/x-www-form-urlencoded',
             'Origin: https://api.razorpay.com',
-            // Real browser Referer: checkout iframe page, not the long checkout/public URL
-            'Referer: https://api.razorpay.com/',
+            'Referer: ' . $referer,
+            'sec-ch-ua: ' . $p['sec_ch_ua'],
+            'sec-ch-ua-mobile: ' . $p['sec_ch_ua_mobile'],
+            'sec-ch-ua-platform: ' . $p['sec_ch_ua_platform'],
+            'User-Agent: ' . $p['user_agent'],
             'Sec-Fetch-Dest: empty',
             'Sec-Fetch-Mode: cors',
             'Sec-Fetch-Site: same-origin',
-            // Chrome 117+ sends Priority on every XHR — Razorpay WAF fingerprints for it
-            // on /payments/create/ajax. Missing = 403 regardless of IP or proxy.
             'Priority: u=1, i',
             'x-razorpay-trackid: ' . $trackId,
             'x-session-token: ' . ($this->tokens['session_token'] ?? ''),
-        ]);
+        ];
     }
 
     /**
@@ -2193,10 +2207,11 @@ final class RazorpayCheckoutSession
     {
         $p = $this->profile;
 
-        // Order matches Chrome 117+ request header order: specific headers first, then common
+        // Note: Accept-Encoding is NOT added here — CURLOPT_ENCODING='' in request()
+        // already tells curl to add its own Accept-Encoding and auto-decompress.
+        // Adding it here too creates a duplicate header which looks like a bot.
         return array_merge($extra, [
             'Accept-Language: ' . $p['accept_language'],
-            'Accept-Encoding: gzip, deflate, br, zstd',
             'Connection: keep-alive',
             'User-Agent: ' . $p['user_agent'],
             'sec-ch-ua: ' . $p['sec_ch_ua'],
