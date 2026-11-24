@@ -1555,9 +1555,6 @@ final class RazorpayCheckoutSession
         return http_build_query($meta, '', '&', PHP_QUERY_RFC3986);
     }
 
-        return http_build_query($meta, '', '&', PHP_QUERY_RFC3986);
-    }
-
     /** SHA1 segment from rzp_device_id (1.{hash}.{ts}.{rand}) */
     private function rtbDeviceId(): string
     {
