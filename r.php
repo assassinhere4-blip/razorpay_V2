@@ -950,6 +950,15 @@ final class RazorpayCheckoutSession
      */
     private static function outcomeFromApiError(int $httpCode, string $response): ?array
     {
+        // 403 = WAF/nginx IP block — handle before JSON parse (response is HTML not JSON)
+        if ($httpCode === 403) {
+            return [
+                'status'  => 'error',
+                'message' => 'WAF Blocked — Change Proxy',
+                'reason'  => 'waf_403',
+            ];
+        }
+
         $payload = json_decode($response, true);
         if (!is_array($payload)) {
             return null;
@@ -1532,7 +1541,11 @@ final class RazorpayCheckoutSession
         }
 
         $plId = trim($this->tokens['payment_link_id'] ?? '');
-        if ($plId !== '') {
+        // Only send payment_link_id for ppl_ (Payment Page) sites.
+        // pl_ (Payment Link) sites — pages.razorpay.com/pl_* — crash with HTTP 400
+        // SERVER_ERROR when payment_link_id is present in the payment body.
+        // Real checkout.js does NOT send payment_link_id for pl_ payment links.
+        if ($plId !== '' && str_starts_with($plId, 'ppl_')) {
             $meta['payment_link_id'] = $plId;
         }
 
@@ -1947,6 +1960,7 @@ final class RazorpayCheckoutSession
             'Accept: */*',
             'Content-type: application/x-www-form-urlencoded',
             'Origin: https://api.razorpay.com',
+            'priority: u=1, i',
             'Referer: ' . $this->checkoutPublicUrl(true),
             'Sec-Fetch-Dest: empty',
             'Sec-Fetch-Mode: cors',
@@ -2000,10 +2014,17 @@ final class RazorpayCheckoutSession
         return $this->baseHeaders($headers);
     }
 
-    /** Use proxy for ALL requests including payments/create/ajax — proxy required for card checking. */
+    /** Use proxy for all steps including payment create.
+     *  403 on payment create is a request fingerprint issue (missing priority header),
+     *  NOT an IP issue — consistent 403 across ALL proxy IPs confirmed.
+     *  Fix: route payment create through proxy AND send correct Chrome XHR headers. */
     private function shouldUseProxyForUrl(string $url): bool
     {
-        return true; // Always use proxy; direct IP causes WAF SERVER_ERROR on payment create
+        // 3DS authenticate and cancel: direct (payment_id tied to same session)
+        if (str_contains($url, '/pg_router/') || str_contains($url, '/authenticate')) {
+            return false;
+        }
+        return true; // All steps (including payment create) use proxy
     }
 
     private function requestJson(string $method, string $url, array $headers, array $payload): string
@@ -2056,8 +2077,8 @@ final class RazorpayCheckoutSession
                 $opts[CURLOPT_SSL_VERIFYPEER]  = false;
                 $opts[CURLOPT_SSL_VERIFYHOST]  = 0;
                 $opts[CURLOPT_HTTP_VERSION]    = CURL_HTTP_VERSION_1_1; // force HTTP/1.1 — no HTTP/2 over proxy
-                $opts[CURLOPT_SSLVERSION]      = CURL_SSLVERSION_TLSv1_2; // force TLS 1.2 — prevents eof errors
                 $opts[CURLOPT_TCP_NODELAY]     = true; // disable Nagle — prevents stalls
+                // Note: TLS version NOT forced — let system negotiate TLS 1.3 like a real Chrome browser
             }
         }
 
@@ -2077,6 +2098,10 @@ final class RazorpayCheckoutSession
         $this->log('HTTP ' . $code . ' â† ' . $this->shortUrl($url) . ' (' . strlen((string) $response) . ' bytes)');
 
         if ($throwOnHttpError && $code >= 400) {
+            // For WAF/CDN blocks (403, HTML response) give a clean error, not raw HTML
+            if ($code === 403) {
+                throw new RuntimeException("HTTP 403 WAF Blocked for {$url} — change proxy");
+            }
             throw new RuntimeException("HTTP {$code} for {$url}: " . substr((string) $response, 0, 500));
         }
 
