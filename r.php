@@ -809,7 +809,8 @@ final class RazorpayCheckoutSession
         }
 
         if (empty($this->tokens['traffic_env'])) {
-            $this->tokens['traffic_env'] = $this->trafficEnvOverride ?? 'canary';
+            // Live Razorpay pages use 'production'. Only override if env var explicitly set.
+            $this->tokens['traffic_env'] = $this->trafficEnvOverride ?? 'production';
         }
     }
 
@@ -831,6 +832,7 @@ final class RazorpayCheckoutSession
             $data = json_decode($body, true, 512);
 
             if (!is_array($data)) {
+                $this->tokens['preferences_error'] = 'non-JSON response: ' . substr($body, 0, 100);
                 $this->log('  fetchPreferences: non-JSON response, shield_context will be empty');
                 return;
             }
@@ -839,11 +841,17 @@ final class RazorpayCheckoutSession
             $this->tokens['shield_context'] = $shield['shield_context'] ?? '';
             $this->tokens['shield_key']     = $shield['shield_key'] ?? '';
 
+            if (empty($this->tokens['shield_context'])) {
+                $this->tokens['preferences_error'] = 'shield_data missing in response keys: ' . implode(',', array_keys($data));
+            }
+
             $this->logToken('shield_context', $this->tokens['shield_context']);
             $this->logToken('shield_key', $this->tokens['shield_key']);
         } catch (Throwable $e) {
             // Preferences is non-critical — payment can proceed without shield_context
-            $this->log('  fetchPreferences: failed (' . substr($e->getMessage(), 0, 120) . '), continuing without shield');
+            $errMsg = substr($e->getMessage(), 0, 150);
+            $this->tokens['preferences_error'] = $errMsg;
+            $this->log('  fetchPreferences: failed (' . $errMsg . '), continuing without shield');
         }
     }
 
@@ -872,10 +880,21 @@ final class RazorpayCheckoutSession
     {
         $this->ensureCustomerDetails();
 
-        // Include x_entity_id (order_id) in URL — required by Razorpay WAF for payment create
-        $url              = self::PAYMENT_CREATE . '?' . $this->checkoutAuthQuery([
-            'x_entity_id' => $this->tokens['order_id'] ?? '',
-        ]);
+        // Build payment create URL — session_token goes in header only (not URL) for WAF compliance.
+        // Real Chrome XHR sends session_token only as x-session-token header, not in URL query.
+        // keyless_header and x_entity_id still go in URL (Razorpay WAF requires them there).
+        $urlParams = [];
+        $kh = trim($this->tokens['keyless_header'] ?? '');
+        if ($kh !== '') {
+            $urlParams['keyless_header'] = $kh;
+        }
+        $keyId = trim($this->tokens['key_id'] ?? '');
+        if ($keyId !== '') {
+            $urlParams['key_id'] = $keyId;
+        }
+        $urlParams['x_entity_id'] = $this->tokens['order_id'] ?? '';
+
+        $url              = self::PAYMENT_CREATE . '?' . http_build_query($urlParams);
         $includeCheckoutId = false;
         $body             = $this->buildPaymentCreateBody($includeCheckoutId);
 
@@ -909,6 +928,18 @@ final class RazorpayCheckoutSession
 
         $this->tokens['create_response_raw'] = $response;
         $this->tokens['create_http_code']    = $this->lastHttpCode;
+
+        // Handle 403 WAF block — set forced outcome instead of throwing
+        // so classifyOutcome() returns a clean "WAF Blocked" message
+        if ($this->lastHttpCode === 403) {
+            $this->forcedOutcome = [
+                'status'  => 'error',
+                'message' => 'WAF Blocked — Change Proxy',
+                'reason'  => 'waf_403',
+            ];
+            $this->log('  create payment outcome: WAF 403');
+            return;
+        }
 
         if ($this->lastHttpCode === 400 || $this->lastHttpCode === 500) {
             $outcome = self::outcomeFromApiError($this->lastHttpCode, $response);
@@ -1436,10 +1467,8 @@ final class RazorpayCheckoutSession
                 'preferences_error'     => $this->tokens['preferences_error'] ?? null,
                 'order_currency'        => $this->orderCurrency(),
                 'page_auth_mode'        => $this->tokens['page_auth_mode'] ?? 'unknown',
-                'payment_create_url_has_entity' => str_contains(
-                    self::PAYMENT_CREATE . '?' . $this->checkoutAuthQuery(['x_entity_id' => $this->tokens['order_id'] ?? '']),
-                    'x_entity_id'
-                ),
+                'traffic_env'           => $this->tokens['traffic_env'] ?? 'unknown',
+                'track_id'              => $this->tokens['rzp_track_id'] ?? '',
                 'run_error'             => $this->runError,
             ];
         }
@@ -1530,7 +1559,8 @@ final class RazorpayCheckoutSession
             '_[shield][tz]'             => $shieldTz,
             '_[device_id]'              => $deviceId,
             '_[build]'                  => $this->tokens['build_number'] ?? '26589118452',
-            '_[request_index]'          => '1',
+            '_[request_index]'          => '0',  // Chrome starts at 0 on first payment attempt
+            '_[feat]'                   => '',   // Real checkout.js always sends this (empty on first request)
             'amount'                    => (string) ($this->tokens['order_amount'] ?? $this->amountPaise),
             'order_id'                  => $this->tokens['order_id'] ?? '',
             'user_risk_providers_token' => $riskToken,
@@ -1965,6 +1995,20 @@ final class RazorpayCheckoutSession
 
     private function checkoutApiFormHeaders(): array
     {
+        // x-razorpay-trackid: UUID generated once per checkout session by real browser
+        $trackId = $this->tokens['rzp_track_id'] ?? '';
+        if ($trackId === '') {
+            $trackId = sprintf(
+                '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+                mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+                mt_rand(0, 0xffff),
+                mt_rand(0, 0x0fff) | 0x4000,
+                mt_rand(0, 0x3fff) | 0x8000,
+                mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+            );
+            $this->tokens['rzp_track_id'] = $trackId;
+        }
+
         return $this->baseHeaders([
             'Accept: application/json, text/plain, */*',
             'Content-type: application/x-www-form-urlencoded',
@@ -1974,6 +2018,10 @@ final class RazorpayCheckoutSession
             'Sec-Fetch-Dest: empty',
             'Sec-Fetch-Mode: cors',
             'Sec-Fetch-Site: same-origin',
+            // Chrome 117+ sends Priority on every XHR — Razorpay WAF fingerprints for it
+            // on /payments/create/ajax. Missing = 403 regardless of IP or proxy.
+            'Priority: u=1, i',
+            'x-razorpay-trackid: ' . $trackId,
             'x-session-token: ' . ($this->tokens['session_token'] ?? ''),
         ]);
     }
@@ -2157,14 +2205,16 @@ final class RazorpayCheckoutSession
     {
         $p = $this->profile;
 
-        return array_merge([
+        // Order matches Chrome 117+ request header order: specific headers first, then common
+        return array_merge($extra, [
             'Accept-Language: ' . $p['accept_language'],
+            'Accept-Encoding: gzip, deflate, br, zstd',
             'Connection: keep-alive',
             'User-Agent: ' . $p['user_agent'],
             'sec-ch-ua: ' . $p['sec_ch_ua'],
             'sec-ch-ua-mobile: ' . $p['sec_ch_ua_mobile'],
             'sec-ch-ua-platform: ' . $p['sec_ch_ua_platform'],
-        ], $extra);
+        ]);
     }
 
     private function setCookie(string $name, string $value, int $ttlSeconds): void
@@ -2361,7 +2411,7 @@ try {
         cardIin: $in['cardIin'],
         orderComment: '',
         paymentPageUrl: $in['pageUrl'],
-        trafficEnv: getenv('RAZORPAY_TRAFFIC_ENV') ?: 'canary',
+        trafficEnv: getenv('RAZORPAY_TRAFFIC_ENV') ?: null, // null = auto-detect from checkout.js (production/canary)
         card: $in['card'],
         proxy: $in['proxyCfg']
     );
