@@ -793,6 +793,15 @@ final class RazorpayCheckoutSession
             }
         }
 
+        // Broader fallback patterns for build_number if primary regex missed
+        if (empty($this->tokens['build_number'])) {
+            // Try: v=DIGITS anywhere near "prod" or in variable assignment
+            if (preg_match('/v\s*=\s*(\d{8,})/', $js, $m)) {
+                $this->tokens['build_number'] = $m[1];
+                $this->logToken('build_number (fallback)', $m[1]);
+            }
+        }
+
         if (empty($this->tokens['commit_hash']) && preg_match('/g="([a-f0-9]{40})"/', $js, $m)) {
             $this->tokens['commit_hash'] = $m[1];
             $this->logToken('commit_hash', $m[1]);
@@ -2109,6 +2118,21 @@ final class RazorpayCheckoutSession
             CURLOPT_COOKIEFILE     => $this->cookieJar,
             CURLOPT_SSL_VERIFYPEER => !self::insecureSslAllowed(),
             CURLOPT_SSL_VERIFYHOST => self::insecureSslAllowed() ? 0 : 2,
+            // Chrome TLS fingerprint: force TLS 1.2+ and Chrome-like cipher suite order.
+            // Razorpay WAF uses JA3/JA4 TLS fingerprinting on /payments/create/ajax.
+            // curl's default cipher order differs from Chrome — this makes it match.
+            CURLOPT_SSLVERSION     => CURL_SSLVERSION_TLSv1_2,
+            CURLOPT_SSL_CIPHER_LIST => implode(':', [
+                'TLS_AES_128_GCM_SHA256',
+                'TLS_AES_256_GCM_SHA384',
+                'TLS_CHACHA20_POLY1305_SHA256',
+                'ECDHE-ECDSA-AES128-GCM-SHA256',
+                'ECDHE-RSA-AES128-GCM-SHA256',
+                'ECDHE-ECDSA-AES256-GCM-SHA384',
+                'ECDHE-RSA-AES256-GCM-SHA384',
+                'ECDHE-ECDSA-CHACHA20-POLY1305',
+                'ECDHE-RSA-CHACHA20-POLY1305',
+            ]),
         ];
 
         if ($body !== null) {
@@ -2126,15 +2150,15 @@ final class RazorpayCheckoutSession
             }
             // Force HTTP CONNECT tunnel for HTTPS — without this, proxy sends plain HTTP
             // to an HTTPS endpoint causing "wrong version number" TLS error.
-            // Also force HTTP/1.1 — HTTP/2 multiplexing over proxy CONNECT tunnels causes
-            // "unexpected eof while reading" TLS errors with residential proxies.
             if (str_starts_with($url, 'https://')) {
                 $opts[CURLOPT_HTTPPROXYTUNNEL] = true;
                 $opts[CURLOPT_SSL_VERIFYPEER]  = false;
                 $opts[CURLOPT_SSL_VERIFYHOST]  = 0;
-                $opts[CURLOPT_HTTP_VERSION]    = CURL_HTTP_VERSION_1_1; // force HTTP/1.1 — no HTTP/2 over proxy
-                $opts[CURLOPT_TCP_NODELAY]     = true; // disable Nagle — prevents stalls
-                // Note: TLS version NOT forced — let system negotiate TLS 1.3 like a real Chrome browser
+                // Use HTTP/2 through proxy — Chrome uses H2 for api.razorpay.com.
+                // HTTP/1.1 is a WAF fingerprint flag. If H2 fails (eof error on some proxies),
+                // the error is caught by the try/catch in run() and classified cleanly.
+                $opts[CURLOPT_HTTP_VERSION]    = CURL_HTTP_VERSION_2TLS;
+                $opts[CURLOPT_TCP_NODELAY]     = true;
             }
         }
 
