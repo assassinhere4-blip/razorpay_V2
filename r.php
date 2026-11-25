@@ -1992,8 +1992,6 @@ final class RazorpayCheckoutSession
 
     private function checkoutApiFormHeaders(): array
     {
-    private function checkoutApiFormHeaders(): array
-    {
         // x-razorpay-trackid: UUID generated once per checkout session by real browser
         $trackId = $this->tokens['rzp_track_id'] ?? '';
         if ($trackId === '') {
