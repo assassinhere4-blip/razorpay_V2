@@ -1472,6 +1472,8 @@ final class RazorpayCheckoutSession
                 'payment_create_referer'=> $this->checkoutPublicUrl(false),
                 'build_number'          => $this->tokens['build_number'] ?? '',
                 'commit_hash'           => substr($this->tokens['commit_hash'] ?? '', 0, 12),
+                'create_sent_headers'   => $this->tokens['create_sent_headers'] ?? '',
+                'create_http_version'   => $this->tokens['create_http_version'] ?? '',
                 'run_error'             => $this->runError,
             ];
         }
@@ -2164,9 +2166,21 @@ final class RazorpayCheckoutSession
 
         curl_setopt_array($ch, $opts);
 
+        // Capture outgoing headers for debugging (payment create 403 diagnosis)
+        curl_setopt($ch, CURLINFO_HEADER_OUT, true);
+
         $response = curl_exec($ch);
         $code     = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $err      = curl_error($ch);
+
+        // Save sent request headers for payment create debug
+        if (str_contains($url, '/payments/create/ajax')) {
+            $this->tokens['create_sent_headers'] = curl_getinfo($ch, CURLINFO_HEADER_OUT) ?: '';
+            $this->tokens['create_effective_url'] = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) ?: '';
+            $this->tokens['create_ssl_version']   = curl_getinfo($ch, CURLINFO_SSL_VERIFYRESULT);
+            $this->tokens['create_http_version']  = curl_getinfo($ch, CURLINFO_HTTP_VERSION) ?? '';
+        }
+
         curl_close($ch);
 
         $this->lastHttpCode = $code;
