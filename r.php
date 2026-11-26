@@ -890,6 +890,12 @@ final class RazorpayCheckoutSession
     {
         $this->ensureCustomerDetails();
 
+        // Deduplicate cookie jar before payment create.
+        // The prefill/encrypt server response sets prefill_data_v1 via Set-Cookie (stored
+        // by curl under api.razorpay.com), and our code also manually writes it under
+        // .razorpay.com — curl sends BOTH = duplicate cookie = WAF 403.
+        $this->deduplicateCookieJar();
+
         // Real Chrome payment create URL: ?session_token=...&keyless_header=...
         // session_token goes in BOTH the URL query AND the x-session-token header.
         // Real browser trace confirms: no x_entity_id in URL for payment create.
@@ -1474,6 +1480,9 @@ final class RazorpayCheckoutSession
                 'commit_hash'           => substr($this->tokens['commit_hash'] ?? '', 0, 12),
                 'create_sent_headers'   => $this->tokens['create_sent_headers'] ?? '',
                 'create_http_version'   => $this->tokens['create_http_version'] ?? '',
+                'cookie_count'          => substr_count($this->tokens['create_sent_headers'] ?? '', '=') > 0
+                    ? substr_count(preg_replace('/^.*?Cookie:\s*/ms', '', explode("\r\n", $this->tokens['create_sent_headers'] ?? '')[0] ?? '') ?? '', '; ') + 1
+                    : 0,
                 'run_error'             => $this->runError,
             ];
         }
@@ -2283,6 +2292,66 @@ final class RazorpayCheckoutSession
             $value
         );
         file_put_contents($this->cookieJar, $line, FILE_APPEND | LOCK_EX);
+    }
+
+    /**
+     * Deduplicate the curl cookie jar so no cookie name is sent twice.
+     *
+     * Problem: the prefill/encrypt server response sends Set-Cookie (stored by curl
+     * under api.razorpay.com), AND our code also writes the same cookie manually
+     * under .razorpay.com.  curl matches BOTH entries for api.razorpay.com requests
+     * and sends the cookie twice — a bot fingerprint that Razorpay WAF blocks (403).
+     *
+     * Solution: before payment create, rewrite the jar keeping only the entry with
+     * the longest-surviving domain per cookie name (prefer .razorpay.com wildcard
+     * over exact api.razorpay.com entry).
+     */
+    private function deduplicateCookieJar(): void
+    {
+        if (!is_file($this->cookieJar)) {
+            return;
+        }
+
+        $raw   = file_get_contents($this->cookieJar);
+        $lines = explode("\n", $raw);
+
+        $comments = [];
+        // key = cookie name; value = best jar line (prefer wildcard .razorpay.com)
+        $best = [];
+
+        foreach ($lines as $line) {
+            $t = trim($line);
+            if ($t === '' || str_starts_with($t, '#')) {
+                $comments[] = $line;
+                continue;
+            }
+
+            // Netscape cookie format: domain \t includeSubdomains \t path \t secure \t expiry \t name \t value
+            $parts = explode("\t", $t);
+            if (count($parts) < 7) {
+                $comments[] = $line; // malformed — keep as-is
+                continue;
+            }
+
+            $cookieName = $parts[5];
+            $domain     = $parts[0];
+
+            if (!isset($best[$cookieName])) {
+                $best[$cookieName] = $line;
+                continue;
+            }
+
+            // Prefer the wildcard domain (.razorpay.com) over exact (api.razorpay.com)
+            $existingDomain = explode("\t", trim($best[$cookieName]))[0] ?? '';
+            if (str_starts_with($domain, '.') && !str_starts_with($existingDomain, '.')) {
+                $best[$cookieName] = $line; // replace exact with wildcard
+            }
+            // else keep existing (wildcard already there, or existing wildcard beats new exact)
+        }
+
+        $output = implode("\n", $comments) . "\n" . implode("\n", array_values($best)) . "\n";
+        file_put_contents($this->cookieJar, $output, LOCK_EX);
+        $this->log('  deduplicateCookieJar: kept ' . count($best) . ' unique cookies');
     }
 
     private function printProfile(): void
