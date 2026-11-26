@@ -2113,7 +2113,7 @@ final class RazorpayCheckoutSession
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_MAXREDIRS      => 5,
             CURLOPT_TIMEOUT        => 60,
-            CURLOPT_ENCODING       => '',
+            CURLOPT_ENCODING       => 'gzip, deflate, br, zstd', // Chrome order (not curl default: deflate, gzip)
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_HTTPHEADER     => $headers,
             CURLOPT_COOKIEJAR      => $this->cookieJar,
@@ -2243,9 +2243,8 @@ final class RazorpayCheckoutSession
     {
         $p = $this->profile;
 
-        // Note: Accept-Encoding is NOT added here — CURLOPT_ENCODING='' in request()
-        // already tells curl to add its own Accept-Encoding and auto-decompress.
-        // Adding it here too creates a duplicate header which looks like a bot.
+        // Note: Accept-Encoding is set via CURLOPT_ENCODING in request() with Chrome order
+        // (gzip, deflate, br, zstd). NOT added here to avoid duplicate header.
         return array_merge($extra, [
             'Accept-Language: ' . $p['accept_language'],
             'Connection: keep-alive',
@@ -2268,7 +2267,9 @@ final class RazorpayCheckoutSession
 
     private function setApiCookie(string $name, string $value, int $ttlSeconds): void
     {
-        $this->writeCookieLine('api.razorpay.com', $name, $value, $ttlSeconds);
+        // Write ONLY to .razorpay.com (wildcard covers api.razorpay.com).
+        // Previously wrote to BOTH api.razorpay.com AND .razorpay.com — causing
+        // curl to send every cookie 2-3x (duplicate cookies = bot fingerprint = 403).
         $this->writeCookieLine('.razorpay.com', $name, $value, $ttlSeconds);
     }
 
