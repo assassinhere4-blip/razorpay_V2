@@ -1480,9 +1480,13 @@ final class RazorpayCheckoutSession
                 'commit_hash'           => substr($this->tokens['commit_hash'] ?? '', 0, 12),
                 'create_sent_headers'   => $this->tokens['create_sent_headers'] ?? '',
                 'create_http_version'   => $this->tokens['create_http_version'] ?? '',
-                'cookie_count'          => substr_count($this->tokens['create_sent_headers'] ?? '', '=') > 0
-                    ? substr_count(preg_replace('/^.*?Cookie:\s*/ms', '', explode("\r\n", $this->tokens['create_sent_headers'] ?? '')[0] ?? '') ?? '', '; ') + 1
-                    : 0,
+                'cookie_count'          => (function () {
+                    $hdrs = $this->tokens['create_sent_headers'] ?? '';
+                    if (preg_match('/\r\nCookie:\s*([^\r\n]+)/i', $hdrs, $m)) {
+                        return substr_count(trim($m[1]), ';') + 1;
+                    }
+                    return 0;
+                })(),
                 'run_error'             => $this->runError,
             ];
         }
@@ -2048,7 +2052,6 @@ final class RazorpayCheckoutSession
             'Sec-Fetch-Site: same-origin',
             'Priority: u=1, i',
             'x-razorpay-trackid: ' . $trackId,
-            'x-session-token: ' . ($this->tokens['session_token'] ?? ''),
         ];
     }
 
