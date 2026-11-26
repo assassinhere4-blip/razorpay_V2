@@ -1480,6 +1480,9 @@ final class RazorpayCheckoutSession
                 'commit_hash'           => substr($this->tokens['commit_hash'] ?? '', 0, 12),
                 'create_sent_headers'   => $this->tokens['create_sent_headers'] ?? '',
                 'create_http_version'   => $this->tokens['create_http_version'] ?? '',
+                'create_tls_version'    => $this->tokens['create_tls_version'] ?? '',
+                'create_body_keys'      => $this->tokens['create_body_keys'] ?? '',
+                'create_body_len'       => $this->tokens['create_body_len'] ?? '',
                 'cookie_count'          => (function () {
                     $hdrs = $this->tokens['create_sent_headers'] ?? '';
                     if (preg_match('/\r\nCookie:\s*([^\r\n]+)/i', $hdrs, $m)) {
@@ -2052,6 +2055,9 @@ final class RazorpayCheckoutSession
             'Sec-Fetch-Site: same-origin',
             'Priority: u=1, i',
             'x-razorpay-trackid: ' . $trackId,
+            // Real Razorpay checkout.js sends x-session-token header alongside the URL param.
+            // The WAF validates both — sending only the URL param (no header) is a bot signal.
+            'x-session-token: ' . ($this->tokens['session_token'] ?? ''),
         ];
     }
 
@@ -2132,20 +2138,24 @@ final class RazorpayCheckoutSession
             CURLOPT_COOKIEFILE     => $this->cookieJar,
             CURLOPT_SSL_VERIFYPEER => !self::insecureSslAllowed(),
             CURLOPT_SSL_VERIFYHOST => self::insecureSslAllowed() ? 0 : 2,
-            // Chrome TLS fingerprint: force TLS 1.2+ and Chrome-like cipher suite order.
-            // Razorpay WAF uses JA3/JA4 TLS fingerprinting on /payments/create/ajax.
-            // curl's default cipher order differs from Chrome — this makes it match.
-            CURLOPT_SSLVERSION     => CURL_SSLVERSION_TLSv1_2,
+            // Chrome TLS fingerprint: allow TLS 1.3 (Chrome 133+ negotiates TLS 1.3 by default).
+            // Forcing TLS 1.2 produces a different JA3 hash. CURL_SSLVERSION_MAX_DEFAULT
+            // lets curl negotiate TLS 1.3 like Chrome does.
+            CURLOPT_SSLVERSION      => CURL_SSLVERSION_MAX_DEFAULT,
+            // TLS 1.3 cipher suites in Chrome order
+            CURLOPT_TLS13_CIPHERS   => 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256',
+            // TLS 1.2 fallback cipher suites in Chrome order
             CURLOPT_SSL_CIPHER_LIST => implode(':', [
-                'TLS_AES_128_GCM_SHA256',
-                'TLS_AES_256_GCM_SHA384',
-                'TLS_CHACHA20_POLY1305_SHA256',
                 'ECDHE-ECDSA-AES128-GCM-SHA256',
                 'ECDHE-RSA-AES128-GCM-SHA256',
                 'ECDHE-ECDSA-AES256-GCM-SHA384',
                 'ECDHE-RSA-AES256-GCM-SHA384',
                 'ECDHE-ECDSA-CHACHA20-POLY1305',
                 'ECDHE-RSA-CHACHA20-POLY1305',
+                'ECDHE-RSA-AES128-SHA',
+                'ECDHE-RSA-AES256-SHA',
+                'AES128-GCM-SHA256',
+                'AES256-GCM-SHA384',
             ]),
         ];
 
@@ -2191,6 +2201,20 @@ final class RazorpayCheckoutSession
             $this->tokens['create_effective_url'] = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) ?: '';
             $this->tokens['create_ssl_version']   = curl_getinfo($ch, CURLINFO_SSL_VERIFYRESULT);
             $this->tokens['create_http_version']  = curl_getinfo($ch, CURLINFO_HTTP_VERSION) ?? '';
+            // Log TLS version actually negotiated
+            $this->tokens['create_tls_version']   = curl_getinfo($ch, CURLINFO_SSL_ENGINES) ? 'ssl_engines' : '';
+            $tlsInfo = curl_getinfo($ch);
+            $this->tokens['create_tls_version']   = $tlsInfo['ssl_verify_result'] . ':' . ($tlsInfo['http_version'] ?? '');
+            // Capture body keys for debugging (not values — card data privacy)
+            if ($body !== null) {
+                $bodyKeys = [];
+                parse_str($body, $bodyParsed);
+                foreach (array_keys($bodyParsed) as $k) {
+                    $bodyKeys[] = $k;
+                }
+                $this->tokens['create_body_keys'] = implode(',', $bodyKeys);
+                $this->tokens['create_body_len']  = strlen($body);
+            }
         }
 
         curl_close($ch);
